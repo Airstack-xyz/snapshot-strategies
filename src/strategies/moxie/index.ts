@@ -78,8 +78,6 @@ export async function strategy(
     return map;
   }, {});
 
-  let next_page = 0;
-
   const protocolSubgraphQuery = {
     portfolios: {
       __args: {
@@ -101,31 +99,6 @@ export async function strategy(
     }
   };
 
-  //Adding block to the query if the snapshot is not latest
-  if (snapshot !== 'latest') {
-    protocolSubgraphQuery.portfolios.__args['block'] = { number: snapshot };
-  }
-
-  // Query the protocol subgraph to get the staked and unstaked balances of the addresses and multiply them with the current price of the token and the multipliers
-  while (next_page != -1) {
-    protocolSubgraphQuery.portfolios.__args.skip = next_page * QUERY_LIMIT;
-    const protocolResponse = await subgraphRequest(MOXIE_PROTOCOL_SUBGRAPH_URL, protocolSubgraphQuery);
-    if (protocolResponse.portfolios.length < QUERY_LIMIT) {
-      next_page = -1;
-    }
-
-    // Here we need to start multiplying and getting scores
-    protocolResponse.portfolios.forEach((portfolio) => {
-      const userAddress = getAddress(portfolio.user.id);
-      allAddressesScoreMap[userAddress] += parseFloat(formatUnits(portfolio.unstakedBalance, MOXIE_DECIMALS)) * UNSTAKED_FAN_TOKEN_MULTIPLIER * portfolio.subjectToken.currentPriceInMoxie +
-        parseFloat(formatUnits(portfolio.stakedBalance, MOXIE_DECIMALS)) * STAKED_FAN_TOKEN_MULTIPLIER * portfolio.subjectToken.currentPriceInMoxie;
-    });
-
-    if (next_page == -1) break;
-    next_page++;
-  }
-
-  next_page = 0;
   const liquidityPoolSubgraphQuery = {
     userPools: {
       __args: {
@@ -146,40 +119,62 @@ export async function strategy(
     }
   };
 
-  //Adding block to the query if the snapshot is not latest
+  //Adding block to the queries if the snapshot is not latest
   if (snapshot !== 'latest') {
+    protocolSubgraphQuery.portfolios.__args['block'] = { number: snapshot };
     liquidityPoolSubgraphQuery.userPools.__args['block'] = { number: snapshot };
   }
 
-  // Query the liquidity pool subgraph to get the liquidity pool contribution of a user and then multiply it with the multipliers
-  while (next_page != -1) {
-    liquidityPoolSubgraphQuery.userPools.__args.skip = next_page * QUERY_LIMIT;
-    const liquidityPoolResponse = await subgraphRequest(MOXIE_LIQUIDITY_POOL_SUBGRAPH_URL, liquidityPoolSubgraphQuery);
-    if (liquidityPoolResponse.userPools.length < QUERY_LIMIT) {
-      next_page = -1;
+  const fetchSubgraphData = async (subgraphUrl, query, processFunction, key) => {
+    let next_page = 0;
+    while (true) {
+      query[key].__args.skip = next_page * QUERY_LIMIT;
+      const response = await subgraphRequest(subgraphUrl, query);
+      const data = response[Object.keys(response)[0]];
+      
+      processFunction(data);
+
+      if (data.length < QUERY_LIMIT) break;
+      next_page++;
     }
-    liquidityPoolResponse.userPools.forEach((userPool) => {
+  };
+
+  const processProtocolData = (portfolios) => {
+    portfolios.forEach((portfolio) => {
+      const userAddress = getAddress(portfolio.user.id);
+      allAddressesScoreMap[userAddress] += parseFloat(formatUnits(portfolio.unstakedBalance, MOXIE_DECIMALS)) * UNSTAKED_FAN_TOKEN_MULTIPLIER * portfolio.subjectToken.currentPriceInMoxie +
+        parseFloat(formatUnits(portfolio.stakedBalance, MOXIE_DECIMALS)) * STAKED_FAN_TOKEN_MULTIPLIER * portfolio.subjectToken.currentPriceInMoxie;
+    });
+  };
+
+  const processLiquidityPoolData = (userPools) => {
+    userPools.forEach((userPool) => {
       const userAddress = getAddress(userPool.user.id);
       allAddressesScoreMap[userAddress] += MOXIE_LIQUIDITY_MULTIPLIER * parseFloat(formatUnits(userPool.totalLPAmount, MOXIE_DECIMALS)) *
         parseFloat(formatUnits(userPool.pool.moxieReserve, MOXIE_DECIMALS)) /
         parseFloat(formatUnits(userPool.pool.totalSupply, MOXIE_DECIMALS));
     });
-    if (next_page == -1) break;
-    next_page++;
-  }
-
+  };
+  
   // RPC Call to get balance of Moxie at a block for users
-  const multi = new Multicaller(network, provider, abi, { blockTag });
-  allAddresses.forEach((address) =>
-    multi.call(address, MOXIE_CONTRACT_ADDRESS, 'balanceOf', [address])
-  );
-  const result: Record<string, BigNumberish> = await multi.execute();
+  const fetchBalances = async () => {
+    const multi = new Multicaller(network, provider, abi, { blockTag });
+    allAddresses.forEach((address) =>
+      multi.call(address, MOXIE_CONTRACT_ADDRESS, 'balanceOf', [address])
+    );
+    const result: Record<string, BigNumberish> = await multi.execute();
+    Object.entries(result).forEach(([address, balance]) => {
+      let formattedBalance = parseFloat(formatUnits(balance, MOXIE_DECIMALS));
+      allAddressesScoreMap[getAddress(address)] += formattedBalance;
+    });
+  };
 
-  // Add the Moxie balance to the score
-  Object.entries(result).forEach(([address, balance]) => {
-    let formattedBalance = parseFloat(formatUnits(balance, MOXIE_DECIMALS));
-    allAddressesScoreMap[getAddress(address)] += formattedBalance;
-  });
+  // Fetch data from both subgraphs in parallel
+  await Promise.all([
+    fetchSubgraphData(MOXIE_PROTOCOL_SUBGRAPH_URL, protocolSubgraphQuery, processProtocolData, "portfolios"),
+    fetchSubgraphData(MOXIE_LIQUIDITY_POOL_SUBGRAPH_URL, liquidityPoolSubgraphQuery, processLiquidityPoolData, "userPools"),
+    fetchBalances(),
+  ]);
 
   // Now we have the score for each address we need to ensure it is added to the beneficiary address if it exists
   Object.keys(allAddressesScoreMap).forEach((address) => {
